@@ -1,0 +1,101 @@
+//go:build validation
+
+package rke2k3s
+
+import (
+	"os"
+	"testing"
+
+	"github.com/rancher/shepherd/clients/rancher"
+	extClusters "github.com/rancher/shepherd/extensions/clusters"
+	"github.com/rancher/shepherd/pkg/config"
+	"github.com/rancher/shepherd/pkg/config/operations"
+	"github.com/rancher/shepherd/pkg/session"
+	"github.com/rancher/tests/actions/clusters"
+	"github.com/rancher/tests/actions/config/defaults"
+	"github.com/rancher/tests/actions/etcdsnapshot"
+	"github.com/rancher/tests/actions/provisioninginput"
+	resources "github.com/rancher/tests/validation/provisioning/resources/provisioncluster"
+	standard "github.com/rancher/tests/validation/provisioning/resources/standarduser"
+	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
+)
+
+type SnapshotRestoreWindowsTestSuite struct {
+	suite.Suite
+	session            *session.Session
+	client             *rancher.Client
+	standardUserClient *rancher.Client
+	cattleConfig       map[string]any
+	clusterConfig      *clusters.ClusterConfig
+	rke2ClusterID      string
+}
+
+func (s *SnapshotRestoreWindowsTestSuite) TearDownSuite() {
+	s.session.Cleanup()
+}
+
+func (s *SnapshotRestoreWindowsTestSuite) SetupSuite() {
+	testSession := session.NewSession()
+	s.session = testSession
+
+	client, err := rancher.NewClient("", s.session)
+	require.NoError(s.T(), err)
+
+	s.client = client
+
+	s.standardUserClient, err = standard.CreateStandardUser(s.client)
+	require.NoError(s.T(), err)
+
+	s.cattleConfig = config.LoadConfigFromFile(os.Getenv(config.ConfigEnvironmentKey))
+
+	s.clusterConfig = new(clusters.ClusterConfig)
+	operations.LoadObjectFromMap(defaults.ClusterConfigKey, s.cattleConfig, s.clusterConfig)
+
+	nodeRolesStandard := []provisioninginput.MachinePools{
+		provisioninginput.EtcdMachinePool,
+		provisioninginput.ControlPlaneMachinePool,
+		provisioninginput.WorkerMachinePool,
+		provisioninginput.WindowsMachinePool,
+	}
+
+	nodeRolesStandard[0].MachinePoolConfig.Quantity = 3
+	nodeRolesStandard[1].MachinePoolConfig.Quantity = 2
+	nodeRolesStandard[2].MachinePoolConfig.Quantity = 3
+	nodeRolesStandard[3].MachinePoolConfig.Quantity = 1
+
+	s.clusterConfig.MachinePools = nodeRolesStandard
+
+	s.rke2ClusterID, err = resources.ProvisionRKE2K3SCluster(s.T(), s.standardUserClient, extClusters.RKE2ClusterType.String(), s.clusterConfig, true, true)
+	require.NoError(s.T(), err)
+}
+
+func (s *SnapshotRestoreWindowsTestSuite) TestSnapshotRestoreWindows() {
+	snapshotRestoreNone := &etcdsnapshot.Config{
+		UpgradeKubernetesVersion: "",
+		SnapshotRestore:          "none",
+		RecurringRestores:        1,
+	}
+
+	tests := []struct {
+		name         string
+		etcdSnapshot *etcdsnapshot.Config
+		clusterID    string
+	}{
+		{"RKE2 Windows restore etcd only", snapshotRestoreNone, s.rke2ClusterID},
+	}
+
+	for _, tt := range tests {
+		cluster, err := s.client.Steve.SteveType(provisioningSteveResourceType).ByID(tt.clusterID)
+		require.NoError(s.T(), err)
+
+		s.Run(tt.name, func() {
+			err := etcdsnapshot.CreateAndValidateSnapshotRestore(s.client, cluster.Name, tt.etcdSnapshot, windowsContainerImage)
+			require.NoError(s.T(), err)
+		})
+	}
+}
+
+func TestSnapshotRestoreWindowsTestSuite(t *testing.T) {
+	suite.Run(t, new(SnapshotRestoreWindowsTestSuite))
+}
